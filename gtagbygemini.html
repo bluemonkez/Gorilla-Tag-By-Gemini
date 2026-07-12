@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebXR Gorilla Tag Prototype</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; font-family: sans-serif; }
+        #info {
+            position: absolute; top: 10px; width: 100%; text-align: center;
+            color: white; z-index: 100; pointer-events: none;
+        }
+    </style>
+    <!-- Include Three.js via CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+    <div id="info">
+        <h2>WebXR Gorilla Tag Engine</h2>
+        <p>Open this link inside your Meta Quest Browser and click "Enter VR"</p>
+    </div>
+
+    <script>
+        // --- 1. SETUP THREE.JS SCENE & RENDERER ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x223344);
+        scene.fog = new THREE.FogExp2(0x223344, 0.05);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.xr.enabled = true; // Crucial for WebXR support
+        document.body.appendChild(renderer.domElement);
+
+        // --- 2. ADD LIGHTING ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        // --- 3. CREATE PLAYER RIG ---
+        // In WebXR, the camera moves relative to a parent Group
+        const playerGroup = new THREE.Group();
+        playerGroup.position.set(0, 1, 5); // Start slightly elevated
+        scene.add(playerGroup);
+        playerGroup.add(camera);
+
+        // --- 4. BUILD THE WORLD MAP (COLLISION OBJECTS) ---
+        const collidableMeshList = [];
+
+        // Main floor
+        const floorGeo = new THREE.BoxGeometry(60, 2, 60);
+        const floorMat = new THREE.MeshStandardMaterial({ color: 0x445533 });
+        const floor = new THREE.Mesh(floorGeo, floorMat);
+        floor.position.y = -1; // Top of floor sits at y=0
+        scene.add(floor);
+        collidableMeshList.push(floor);
+
+        // Floating platforms to jump on
+        const platMat = new THREE.MeshStandardMaterial({ color: 0x885533 });
+        const platConfigs = [
+            { size: [4, 1, 4], pos: [0, 1.5, 0] },
+            { size: [5, 1, 3], pos: [-4, 3, -4] },
+            { size: [3, 1, 3], pos: [4, 4.5, -2] },
+            { size: [4, 4, 4], pos: [0, 2, -10] } // Large block
+        ];
+
+        platConfigs.forEach(cfg => {
+            const geo = new THREE.BoxGeometry(...cfg.size);
+            const mesh = new THREE.Mesh(geo, platMat);
+            mesh.position.set(...cfg.pos);
+            scene.add(mesh);
+            collidableMeshList.push(mesh);
+        });
+
+        // --- 5. SETUP CONTROLLERS ---
+        const controllers = [];
+        const controllerPreviousPositions = [];
+
+        function onSelectStart() { /* Optional interactions */ }
+        function onSelectEnd() { /* Optional interactions */ }
+
+        for (let i = 0; i < 2; i++) {
+            const controller = renderer.xr.getController(i);
+            controller.addEventListener('selectstart', onSelectStart);
+            controller.addEventListener('selectend', onSelectEnd);
+            playerGroup.add(controller);
+            controllers.push(controller);
+
+            // Add visual spheres representing your "hands"
+            const handGeo = new THREE.SphereGeometry(0.1, 16, 16);
+            const handMat = new THREE.MeshStandardMaterial({ color: i === 0 ? 0xff0000 : 0x0000ff });
+            const handMesh = new THREE.Mesh(handGeo, handMat);
+            controller.add(handMesh);
+
+            // Keep track of positions to calculate physical push velocity
+            controllerPreviousPositions.push(new THREE.Vector3());
+        }
+
+        // --- 6. ADD WEBXR ENTER BUTTON ---
+        // Standard WebXR API connection button
+        if ('xr' in navigator) {
+            navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
+                if (supported) {
+                    const btn = document.createElement('button');
+                    btn.textContent = 'ENTER VR';
+                    btn.style.position = 'absolute';
+                    btn.style.bottom = '20px';
+                    btn.style.left = '50%';
+                    btn.style.transform = 'translateX(-50%)';
+                    btn.style.padding = '12px 24px';
+                    btn.style.fontSize = '16px';
+                    btn.style.fontWeight = 'bold';
+                    btn.style.cursor = 'pointer';
+                    
+                    btn.onclick = () => {
+                        navigator.xr.requestSession('immersive-vr', {
+                            requiredFeatures: ['local-floor']
+                        }).then((session) => {
+                            renderer.xr.setSession(session);
+                            btn.style.display = 'none';
+                        });
+                    };
+                    document.body.appendChild(btn);
+                }
+            });
+        }
+
+        // --- 7. PHYSICS ENGINE & MOVEMENT LOGIC ---
+        let playerVelocity = new THREE.Vector3(0, 0, 0);
+        const gravity = -12.0; 
+        const pushMultiplier = -1.5; // Flings player backward relative to hand push
+        const clock = new THREE.Clock();
+
+        // Helper function to check if a hand is intersecting any map objects
+        function checkHandCollision(worldHandPos) {
+            const handBB = new THREE.Box3().setFromCenterAndSize(worldHandPos, new THREE.Vector3(0.2, 0.2, 0.2));
+            
+            for (let i = 0; i < collidableMeshList.length; i++) {
+                const objBB = new THREE.Box3().setFromObject(collidableMeshList[i]);
+                if (handBB.intersectsBox(objBB)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Simple check to ground player on the main floor boundary
+        function keepPlayerAboveFloor() {
+            if (playerGroup.position.y < 0) {
+                playerGroup.position.y = 0;
+                if (playerVelocity.y < 0) playerVelocity.y = 0;
+            }
+        }
+
+        // --- 8. MAIN ANIMATION LOOP ---
+        renderer.setAnimationLoop(() => {
+            const deltaTime = Math.min(clock.getDelta(), 0.1); // Cap delta time to prevent physics clipping
+
+            // Apply gravity constant
+            playerVelocity.y += gravity * deltaTime;
+            
+            // Move the entire player camera setup by current momentum
+            playerGroup.position.addScaledVector(playerVelocity, deltaTime);
+            keepPlayerAboveFloor();
+
+            // Process hand tracking momentum
+            controllers.forEach((controller, index) => {
+                // Get hand position in absolute world coordinates
+                const worldHandPos = new THREE.Vector3();
+                controller.getWorldPosition(worldHandPos);
+
+                // Check if your virtual hand hit a surface geometry
+                if (checkHandCollision(worldHandPos)) {
+                    // Calculate how fast your real hand moved since last frame
+                    const prevPos = controllerPreviousPositions[index];
+                    const handMovement = new THREE.Vector3().subVectors(worldHandPos, prevPos);
+                    
+                    // Filter out jitter—only push if it's an intentional swing
+                    if (handMovement.length() > 0.01) {
+                        // Project momentum opposite of hand stroke direction
+                        const bounceVelocity = handMovement.clone().divideScalar(deltaTime).multiplyScalar(pushMultiplier);
+                        
+                        // Overwrite player momentum vectors
+                        playerVelocity.copy(bounceVelocity);
+                        playerVelocity.y += 1.5; // Give it a slight vertical pop to launch cleaner
+                    }
+                }
+
+                // Cache current coordinate to evaluate velocity on the next cycle
+                controller.getWorldPosition(controllerPreviousPositions[index]);
+            });
+
+            // Gentle friction drag so you don't skid across the ground forever
+            playerVelocity.x *= 0.95;
+            playerVelocity.z *= 0.95;
+
+            renderer.render(scene, camera);
+        });
+
+        // Handle browser window size changes dynamically
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
